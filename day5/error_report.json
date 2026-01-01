@@ -1,0 +1,30 @@
+{
+  "results": {
+    "https://httpbin.org/status/503": 0,
+    "https://httpbin.org/status/500": 0,
+    "https://httpbin.org/status/429": 0,
+    "https://httpbin.org/status/404": 0,
+    "https://httpbin.org/delay/3": 344,
+    "https://example.com/": 513
+  },
+  "error_stats": {
+    "TransientError": 12.0,
+    "NetworkError": 0.0,
+    "PermanentError": 1.0,
+    "ParseError": 0.0,
+    "successful_retries": 0.0,
+    "avg_retry_wait": 1.1666666666666667,
+    "retry_events": 9.0,
+    "permanent_urls": 1.0,
+    "permanent_error_urls": [
+      "https://httpbin.org/status/404"
+    ]
+  },
+  "speed_stats": {
+    "avg_delay": 0.7,
+    "req_per_sec": 1.61,
+    "blocked": 0.0,
+    "total_requests": 15.0
+  },
+  "elapsed": 9.29556575
+}
