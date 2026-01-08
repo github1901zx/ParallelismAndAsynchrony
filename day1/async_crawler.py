@@ -3,7 +3,8 @@ import logging
 import re
 import time
 import random
-from typing import List, Dict, Optional, Any, Set
+from datetime import datetime
+from typing import List, Dict, Optional, Any, Set, Tuple
 
 import aiohttp
 
@@ -12,11 +13,9 @@ try:
 except Exception:
     HTMLParser = None
 
-# Day 5 retry strategy and error classes
 try:
     from day5.retry_strategy import RetryStrategy, TransientError, PermanentError, NetworkError, ParseError  # type: ignore
 except Exception:
-    # Fallback stubs if Day 5 not available
     class TransientError(Exception):
         pass
     class PermanentError(Exception):
@@ -25,18 +24,16 @@ except Exception:
         pass
     class ParseError(Exception):
         pass
-    RetryStrategy = None  # type: ignore
+    RetryStrategy = None
 
 from html.parser import HTMLParser as _StdlibHTMLParser
 from urllib.parse import urljoin, urlparse, urlunparse
 
-# Day 3 helpers
 try:
     from day3.crawler_queue import CrawlerQueue
     from day3.semaphore_manager import SemaphoreManager
 except Exception:
-    CrawlerQueue = None  # type: ignore
-    SemaphoreManager = None  # type: ignore
+    CrawlerQueue = None    SemaphoreManager = None
 
 
 def _normalize_ws(text: str) -> str:
@@ -149,7 +146,8 @@ class AsyncCrawler:
                  retry_strategy: Optional[Any] = None,
                  cb_threshold: int = 0,
                  cb_window: float = 30.0,
-                 cb_cooldown: float = 60.0) -> None:
+                 cb_cooldown: float = 60.0,
+                 storage: Optional[Any] = None) -> None:
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._session: Optional[aiohttp.ClientSession] = None
         self._connect_timeout = connect_timeout
@@ -157,6 +155,7 @@ class AsyncCrawler:
         self._user_agent = user_agent
         self._logger = logging.getLogger("AsyncCrawler")
         self._parser: Any = HTMLParser() if HTMLParser else _StdlibFallbackParser()
+        self._storage = storage
         # Day 3 state
         self.visited_urls: set = set()
         self.failed_urls: Dict[str, str] = {}
@@ -245,8 +244,11 @@ class AsyncCrawler:
         self._cb_open_until.pop(domain, None)
 
     async def _attempt_fetch(self, url: str, attempt: int = 0) -> str:
+        body, status, content_type = await self._attempt_fetch_page(url, attempt=attempt)
+        return body
+
+    async def _attempt_fetch_page(self, url: str, attempt: int = 0) -> Tuple[str, int, str]:
         assert self._session is not None
-        # Increase timeouts on later attempts
         connect_to = self._connect_timeout * (1.0 + 0.5 * attempt)
         read_to = self._read_timeout * (1.0 + 0.5 * attempt)
         timeout = aiohttp.ClientTimeout(connect=connect_to, sock_read=read_to)
@@ -255,6 +257,7 @@ class AsyncCrawler:
                 text = await resp.text()
                 self._total_requests += 1
                 status = resp.status
+                ctype = resp.headers.get("Content-Type", "")
                 if status == 429 or status == 503 or status == 500:
                     self._logger.warning(f"HTTP {status} for {url}")
                     raise TransientError(f"HTTP {status}")
@@ -266,7 +269,7 @@ class AsyncCrawler:
                     self._logger.warning(f"HTTP {status} for {url}")
                     raise PermanentError(f"HTTP {status}")
                 self._logger.info(f"Done: {url} [{status}]")
-                return text
+                return text, status, ctype
         except asyncio.TimeoutError as e:
             self._logger.warning(f"Timeout while fetching {url}")
             raise TransientError(str(e))
@@ -275,25 +278,25 @@ class AsyncCrawler:
             raise NetworkError(str(e))
 
     async def fetch_url(self, url: str) -> str:
+        body, _, _ = await self.fetch_page(url)
+        return body
+
+    async def fetch_page(self, url: str) -> Tuple[str, int, str]:
         await self._ensure_session()
-        # politeness: robots + rate limiting + delays
         parsed = urlparse(url)
         domain = (parsed.netloc or "").lower()
-        # circuit breaker check
         if self._cb_is_open(domain):
             self._logger.warning(f"Circuit open: skipping {url}")
-            return ""
-        # Fetch robots if needed
+            return "", 0, ""
         if self._respect_robots and self._robots is not None:
             try:
                 await self._robots.fetch_robots(url)
                 if not self._robots.can_fetch(url, user_agent=self._user_agent):
                     self._total_blocked += 1
                     self._logger.info(f"Blocked by robots.txt: {url}")
-                    return ""
+                    return "", 0, ""
             except Exception as e:
                 self._logger.debug(f"Robots check failed for {url}: {e}")
-        # Crawl-delay from robots
         delay = 0.0
         if self._respect_robots and self._robots is not None:
             try:
@@ -302,12 +305,10 @@ class AsyncCrawler:
                     delay = rd
             except Exception:
                 pass
-        # Configured min_delay and jitter
         if self._min_delay > delay:
             delay = self._min_delay
         if self._jitter > 0:
             delay += random.uniform(0, self._jitter)
-        # Enforce per-domain spacing for min_delay
         if delay > 0:
             last = self._last_request_time_per_domain.get(domain, 0.0)
             now = time.perf_counter()
@@ -315,39 +316,35 @@ class AsyncCrawler:
             if to_wait > 0:
                 await asyncio.sleep(to_wait)
                 self._cumulative_delay += to_wait
-        # Rate limiter
         if self._rate_limiter is not None:
             try:
                 await self._rate_limiter.acquire(domain if domain else None)
             except Exception:
                 pass
-        # record request time for domain
         self._last_request_time_per_domain[domain] = time.perf_counter()
         async with self._semaphore:
             self._logger.info(f"Start fetching: {url}")
             if self._retry_strategy is None or self._retries <= 0:
-                # Fallback to single attempt with basic handling
                 try:
-                    return await self._attempt_fetch(url, attempt=0)
+                    body, status, ctype = await self._attempt_fetch_page(url, attempt=0)
+                    return body, status, ctype
                 except PermanentError as e:
                     self.failed_urls[url] = str(e)
                     self._error_stats["PermanentError"] += 1.0
                     self._cb_record_failure(domain)
-                    return ""
+                    return "", 0, ""
                 except TransientError:
                     self._error_stats["TransientError"] += 1.0
                     self._cb_record_failure(domain)
-                    return ""
+                    return "", 0, ""
                 except NetworkError:
                     self._error_stats["NetworkError"] += 1.0
                     self._cb_record_failure(domain)
-                    return ""
+                    return "", 0, ""
                 except Exception as e:
                     self._logger.exception(f"Unexpected error while fetching {url}: {e}")
-                    return ""
-            # With retry strategy
+                    return "", 0, ""
             retry_events_before = self._error_stats["retry_events"]
-            last_error: Optional[BaseException] = None
             def on_retry(attempt_idx: int, exc: BaseException, sleep_for: float) -> None:
                 self._error_stats["retry_events"] += 1.0
                 self._retry_wait_total += sleep_for
@@ -361,31 +358,28 @@ class AsyncCrawler:
                 self._logger.info(f"Retrying {url}: attempt={attempt_idx+1}, error={type(exc).__name__}, next in {sleep_for:.2f}s")
                 self._cumulative_delay += sleep_for
             try:
-                text = await self._retry_strategy.execute_with_retry(self._attempt_fetch, url, on_retry=on_retry)
-                # success after potential retries
+                body, status, ctype = await self._retry_strategy.execute_with_retry(self._attempt_fetch_page, url, on_retry=on_retry)
                 if self._error_stats["retry_events"] > retry_events_before:
                     self._error_stats["successful_retries"] += 1.0
                 self._cb_record_success(domain)
-                # update avg retry wait
                 ev = self._error_stats["retry_events"]
                 self._error_stats["avg_retry_wait"] = (self._retry_wait_total / ev) if ev > 0 else 0.0
-                return text
+                return body, status, ctype
             except PermanentError as e:
                 self.failed_urls[url] = str(e)
                 self._error_stats["PermanentError"] += 1.0
                 self._cb_record_failure(domain)
-                return ""
+                return "", 0, ""
             except (TransientError, NetworkError) as e:
-                # ran out of retries
                 if isinstance(e, NetworkError):
                     self._error_stats["NetworkError"] += 1.0
                 else:
                     self._error_stats["TransientError"] += 1.0
                 self._cb_record_failure(domain)
-                return ""
+                return "", 0, ""
             except Exception as e:
                 self._logger.exception(f"Unexpected error while fetching {url}: {e}")
-                return ""
+                return "", 0, ""
 
     async def fetch_urls(self, urls: List[str]) -> Dict[str, str]:
         tasks = [asyncio.create_task(self.fetch_url(u)) for u in urls]
@@ -393,7 +387,8 @@ class AsyncCrawler:
         return {u: r for u, r in zip(urls, results)}
 
     async def fetch_and_parse(self, url: str) -> Dict[str, Any]:
-        html = await self.fetch_url(url)
+        html, status_code, content_type = await self.fetch_page(url)
+        crawled_at = datetime.utcnow().isoformat() + "Z"
         base_result: Dict[str, Any] = {
             "url": url,
             "title": None,
@@ -405,19 +400,42 @@ class AsyncCrawler:
             "tables": [],
             "lists": {"ul": [], "ol": []},
         }
-        if not html:
-            return base_result
-        try:
-            parsed = await self._parser.parse_html(html, url)
-            return parsed
-        except Exception as e:
-            # classify parse errors for stats
+        result: Dict[str, Any] = dict(base_result)
+        if html:
             try:
-                self._error_stats["ParseError"] += 1.0
-            except Exception:
-                pass
-            self._logger.warning(f"Parsing failed for {url}: {e}")
-            return base_result
+                parsed = await self._parser.parse_html(html, url)
+                result = parsed
+            except Exception as e:
+                try:
+                    self._error_stats["ParseError"] += 1.0
+                except Exception:
+                    pass
+                self._logger.warning(f"Parsing failed for {url}: {e}")
+                result = base_result
+        standardized: Dict[str, Any] = {
+            "url": url,
+            "title": result.get("title"),
+            "text": result.get("text") or "",
+            "links": result.get("links") or [],
+            "metadata": result.get("metadata") or {},
+            "crawled_at": crawled_at,
+            "status_code": int(status_code or 0),
+            "content_type": content_type or "",
+        }
+        standardized["images"] = result.get("images") or []
+        standardized["headings"] = result.get("headings") or {"h1": [], "h2": [], "h3": []}
+        standardized["tables"] = result.get("tables") or []
+        standardized["lists"] = result.get("lists") or {"ul": [], "ol": []}
+        # Save if storage is configured
+        if self._storage is not None:
+            for i in range(3):
+                try:
+                    await self._storage.save(standardized)
+                    break
+                except Exception as e:
+                    self._logger.error(f"Storage save failed for {url} (attempt {i+1}/3): {e}")
+                    await asyncio.sleep(min(1.0 * (i + 1), 3.0))
+        return standardized
 
     def get_speed_stats(self) -> Dict[str, float]:
         elapsed_delays = self._cumulative_delay
@@ -432,11 +450,9 @@ class AsyncCrawler:
         }
 
     def get_error_stats(self) -> Dict[str, Any]:
-        # include counts and computed average wait
         ev = self._error_stats.get("retry_events", 0.0)
         if ev > 0:
             self._error_stats["avg_retry_wait"] = (self._retry_wait_total / ev)
-        # Also include count and list of permanent failures
         self._error_stats["permanent_urls"] = float(len(self.failed_urls))
         stats: Dict[str, Any] = dict(self._error_stats)
         stats["permanent_error_urls"] = list(self.failed_urls.keys())
@@ -446,3 +462,8 @@ class AsyncCrawler:
         if self._session is not None and not self._session.closed:
             await self._session.close()
             self._logger.info("HTTP session closed")
+        try:
+            if getattr(self, "_storage", None) is not None:
+                await self._storage.close()
+        except Exception as e:
+            self._logger.warning(f"Storage close failed: {e}")
