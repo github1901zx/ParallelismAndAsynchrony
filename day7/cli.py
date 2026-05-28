@@ -2,11 +2,13 @@ import argparse
 import asyncio
 import json
 import logging
+import sys
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from day1.async_crawler import AsyncCrawler
 from day6.storage import JSONStorage, CSVStorage, SQLiteStorage, DataStorage  # type: ignore
+from day7.advanced_crawler import AdvancedCrawler
 
 try:
     import yaml
@@ -37,7 +39,7 @@ def parse_outputs(values: List[str]) -> List[DataStorage]:
     backends: List[DataStorage] = []
     for v in values:
         if ":" not in v:
-            raise ValueError(f"Invalid --output '{v}'. Expected format:path")
+            raise ValueError(f"Invalid --output '{v}'. Expected format: format:path")
         fmt, path = v.split(":", 1)
         fmt = fmt.strip().lower()
         path = path.strip()
@@ -72,6 +74,20 @@ def load_config(path: Optional[str]) -> Dict[str, Any]:
     raise ValueError("Config file must be valid JSON" + (" or YAML" if yaml is not None else ""))
 
 
+def setup_logging(level: str, log_file: Optional[str] = None, max_bytes: int = 5_000_000, backup_count: int = 3) -> None:
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, level))
+    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    if not any(isinstance(h, logging.StreamHandler) for h in root.handlers):
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setFormatter(fmt)
+        root.addHandler(sh)
+    if log_file:
+        fh = RotatingFileHandler(log_file, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8")
+        fh.setFormatter(fmt)
+        root.addHandler(fh)
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="crawler",
@@ -81,8 +97,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--urls-file", help="Path to a text file with one URL per line")
     parser.add_argument("--config", help="Path to JSON or YAML config file with defaults")
 
+    # Crawl scope
+    parser.add_argument("--max-pages", type=int, default=100, help="Maximum pages to crawl")
+    parser.add_argument("--max-depth", type=int, default=2, help="Maximum link depth from start URLs")
+    parser.add_argument("--same-domain-only", action="store_true", default=True)
+    parser.add_argument("--allow-external", action="store_true", help="Allow crawling external domains")
+    parser.add_argument("--include", action="append", default=[], dest="include_patterns", help="Regex: URL must match")
+    parser.add_argument("--exclude", action="append", default=[], dest="exclude_patterns", help="Regex: URL must not match")
+
+    # Sitemap
+    parser.add_argument("--sitemap", help="Explicit sitemap.xml URL")
+    parser.add_argument("--use-sitemap", action="store_true", help="Auto-fetch /sitemap.xml from start domain")
+
     # Crawler options
     parser.add_argument("--max-concurrent", type=int, default=5)
+    parser.add_argument("--max-per-domain", type=int, default=None)
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--backoff-base", type=float, default=0.5)
     parser.add_argument("--backoff-factor", type=float, default=2.0)
@@ -101,11 +130,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Output target in the form format:path. Repeat to save to multiple formats. Supported: json, csv, sqlite",
     )
     parser.add_argument("--report", default="report.json", help="Path to save summary report JSON")
+    parser.add_argument("--report-html", default="report.html", help="Path to save HTML statistics report")
 
     # Logging
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    parser.add_argument("--log-file", help="Log file path (with rotation)")
+    parser.add_argument("--log-max-bytes", type=int, default=5_000_000)
+    parser.add_argument("--log-backup-count", type=int, default=3)
 
     return parser
+
+
+def _progress_printer(logger: logging.Logger) -> Any:
+    last_reported = {"processed": -1}
+
+    def on_progress(payload: Dict[str, Any]) -> None:
+        processed = int(payload.get("processed") or 0)
+        max_pages = int(payload.get("max_pages") or 0)
+        if processed != last_reported["processed"] and processed % 5 == 0:
+            last_reported["processed"] = processed
+            q = payload.get("queue") or {}
+            logger.info(
+                "Progress: %d/%d pages | queued=%s in_progress=%s failed=%s",
+                processed, max_pages,
+                q.get("queued", "?"), q.get("in_progress", "?"), q.get("failed", "?"),
+            )
+
+    return on_progress
 
 
 async def run_crawl(args: argparse.Namespace, cfg: Dict[str, Any]) -> int:
@@ -139,12 +190,15 @@ async def run_crawl(args: argparse.Namespace, cfg: Dict[str, Any]) -> int:
         return 2
     storage: DataStorage = CompositeStorage(storages) if len(storages) > 1 else storages[0]
 
-    # Rate limiter setting
     rps = cfg.get("requests_per_second", args.requests_per_second)
     rps_val = float(rps) if rps else 0.0
+    same_domain = not args.allow_external
+    if "same_domain_only" in cfg:
+        same_domain = bool(cfg["same_domain_only"])
 
-    crawler = AsyncCrawler(
+    crawler = AdvancedCrawler(
         max_concurrent=int(cfg.get("max_concurrent", args.max_concurrent)),
+        max_per_domain=cfg.get("max_per_domain", args.max_per_domain),
         user_agent=str(cfg.get("user_agent", args.user_agent)),
         retries=int(cfg.get("retries", args.retries)),
         backoff_base=float(cfg.get("backoff_base", args.backoff_base)),
@@ -157,25 +211,59 @@ async def run_crawl(args: argparse.Namespace, cfg: Dict[str, Any]) -> int:
         storage=storage,
     )
 
-    # Crawl concurrently: fetch_and_parse all URLs
+    max_pages = int(cfg.get("max_pages", args.max_pages))
+    max_depth = int(cfg.get("max_depth", args.max_depth))
+    include_patterns = list(cfg.get("include_patterns", []) or []) + list(args.include_patterns or [])
+    exclude_patterns = list(cfg.get("exclude_patterns", []) or []) + list(args.exclude_patterns or [])
+
     try:
-        logger.info("Starting crawl of %d URL(s)", len(urls))
-        tasks = [crawler.fetch_and_parse(u) for u in urls]
-        results = await asyncio.gather(*tasks)
-        # Produce summary report
+        logger.info("Starting crawl from %d seed URL(s), max_pages=%d, max_depth=%d", len(urls), max_pages, max_depth)
+        result = await crawler.crawl(
+            start_urls=urls,
+            max_pages=max_pages,
+            max_depth=max_depth,
+            same_domain_only=same_domain,
+            include_patterns=include_patterns or None,
+            exclude_patterns=exclude_patterns or None,
+            sitemap_url=cfg.get("sitemap", args.sitemap),
+            use_sitemap=bool(cfg.get("use_sitemap", args.use_sitemap)),
+            on_progress=_progress_printer(logger),
+        )
+
         speed = crawler.get_speed_stats()
         try:
             errors = crawler.get_error_stats()
         except Exception:
             errors = {}
+
         report: Dict[str, Any] = {
-            "count": len(results),
+            "count": len(result.get("processed", {})),
+            "failed_count": len(result.get("failed", {})),
+            "visited_count": len(result.get("visited", set())),
             "speed_stats": speed,
             "error_stats": errors,
+            "queue_stats": result.get("stats", {}),
+            "crawler_stats": result.get("crawler_stats", {}),
             "outputs": outputs,
         }
-        Path(args.report).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-        logger.info("Saved report to %s", args.report)
+        report_path = str(cfg.get("report", args.report))
+        Path(report_path).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info("Saved JSON report to %s", report_path)
+
+        html_path = str(cfg.get("report_html", args.report_html))
+        crawler.export_reports(json_path=None, html_path=html_path, extra={
+            "speed_stats": speed,
+            "error_stats": errors,
+            "queue_stats": result.get("stats", {}),
+        })
+        logger.info("Saved HTML report to %s", html_path)
+
+        logger.info(
+            "Crawl finished: %d processed, %d failed, %.2f pages/sec",
+            len(result.get("processed", {})),
+            len(result.get("failed", {})),
+            crawler.stats.pages_per_second,
+        )
     finally:
         await crawler.close()
     return 0
@@ -185,8 +273,6 @@ def main() -> int:
     parser = build_arg_parser()
     args = parser.parse_args()
 
-    logging.basicConfig(level=getattr(logging, args.log_level), format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-
     cfg: Dict[str, Any] = {}
     if args.config:
         try:
@@ -195,8 +281,15 @@ def main() -> int:
             print(f"Failed to load config: {e}")
             return 2
 
-    return asyncio.run(run_crawl(args, cfg))
+    log_file = cfg.get("log_file", args.log_file)
+    setup_logging(
+        str(cfg.get("log_level", args.log_level)),
+        log_file=log_file,
+        max_bytes=int(cfg.get("log_max_bytes", args.log_max_bytes)),
+        backup_count=int(cfg.get("log_backup_count", args.log_backup_count)),
+    )
 
+    return asyncio.run(run_crawl(args, cfg))
 
 
 if __name__ == "__main__":
