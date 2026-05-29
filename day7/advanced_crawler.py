@@ -28,7 +28,7 @@ class AdvancedCrawler(AsyncCrawler):
                 target = SitemapParser.guess_sitemap_url(start_urls[0])
             if target:
                 self._logger.info("Fetching sitemap: %s", target)
-                sitemap_urls = await self._sitemap_parser.fetch_urls(target)
+                sitemap_urls = await self._sitemap_parser.fetch_sitemap(target)
                 self._logger.info("Sitemap returned %d URL(s)", len(sitemap_urls))
                 seen = set(urls)
                 for u in sitemap_urls:

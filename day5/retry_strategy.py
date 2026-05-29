@@ -1,8 +1,9 @@
 import asyncio
+import inspect
 import logging
 import math
 import random
-from typing import Any, Awaitable, Callable, Dict, Iterable, Optional, Tuple, Type, Union
+from typing import Any, Awaitable, Callable, Coroutine, Dict, Iterable, Optional, Tuple, Type, Union
 
 class TransientError(Exception):
     """Temporary error (timeouts, 5xx, backpressure like 429)."""
@@ -21,6 +22,7 @@ class ParseError(Exception):
 
 
 OnRetryCallback = Callable[[int, BaseException, float], None]
+AsyncCallable = Callable[..., Awaitable[Any]]
 
 
 class RetryStrategy:
@@ -45,18 +47,33 @@ class RetryStrategy:
         self.jitter = max(0.0, float(jitter))
         self._logger = logger or logging.getLogger("RetryStrategy")
 
+    @staticmethod
+    def _accepts_attempt(coro: AsyncCallable) -> bool:
+        try:
+            return "attempt" in inspect.signature(coro).parameters
+        except (TypeError, ValueError):
+            return False
+
     async def execute_with_retry(
         self,
-        coro: Callable[..., Awaitable[Any]],
+        coro: Union[AsyncCallable, Coroutine[Any, Any, Any]],
         *args: Any,
         on_retry: Optional[OnRetryCallback] = None,
         **kwargs: Any,
     ) -> Any:
+        if inspect.iscoroutine(coro):
+            raise TypeError(
+                "execute_with_retry expects a coroutine function, not a coroutine object; "
+                "pass the callable and its arguments instead"
+            )
+
         attempt = 0
+        inject_attempt = self._accepts_attempt(coro)
         while True:
             try:
                 call_kwargs = dict(kwargs)
-                call_kwargs.setdefault("attempt", attempt)
+                if inject_attempt:
+                    call_kwargs["attempt"] = attempt
                 return await coro(*args, **call_kwargs)
             except self.retry_on as exc:  # type: ignore[misc]
                 if attempt >= self.max_retries:

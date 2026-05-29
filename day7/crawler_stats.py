@@ -10,8 +10,9 @@ class CrawlerStats:
     """Collects and exports crawl statistics."""
 
     def __init__(self) -> None:
-        self.start_time = time.perf_counter()
-        self.end_time: Optional[float] = None
+        self._started_at = datetime.now(timezone.utc)
+        self._t0 = time.perf_counter()
+        self._end_t: Optional[float] = None
         self.pages_crawled = 0
         self.pages_failed = 0
         self.links_discovered = 0
@@ -42,12 +43,12 @@ class CrawlerStats:
         self.domains[domain] += 1
 
     def finish(self) -> None:
-        self.end_time = time.perf_counter()
+        self._end_t = time.perf_counter()
 
     @property
     def elapsed(self) -> float:
-        end = self.end_time or time.perf_counter()
-        return end - self.start_time
+        end = self._end_t or time.perf_counter()
+        return end - self._t0
 
     @property
     def pages_per_second(self) -> float:
@@ -56,7 +57,7 @@ class CrawlerStats:
 
     def to_dict(self, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         data: Dict[str, Any] = {
-            "started_at": datetime.fromtimestamp(self.start_time, tz=timezone.utc).isoformat(),
+            "started_at": self._started_at.isoformat(),
             "elapsed_seconds": round(self.elapsed, 3),
             "pages_crawled": self.pages_crawled,
             "pages_failed": self.pages_failed,

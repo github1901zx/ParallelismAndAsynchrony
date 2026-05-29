@@ -223,7 +223,7 @@ class SQLiteStorage(DataStorage):
             self._buffer.clear()
         except Exception as e:
             self._logger.error("SQLite batch insert failed: %s", e)
-            # do not drop buffer; try again later
+            raise
 
     async def close(self) -> None:
         if self._db is not None:

@@ -28,9 +28,13 @@ class SitemapParser:
         if self._own_session and self._session is not None and not self._session.closed:
             await self._session.close()
 
-    async def fetch_urls(self, sitemap_url: str) -> List[str]:
+    async def fetch_sitemap(self, sitemap_url: str) -> List[str]:
         seen_sitemaps: Set[str] = set()
         return await self._parse_sitemap(sitemap_url, seen_sitemaps)
+
+    async def fetch_urls(self, sitemap_url: str) -> List[str]:
+        """Backward-compatible alias for fetch_sitemap."""
+        return await self.fetch_sitemap(sitemap_url)
 
     async def _parse_sitemap(self, url: str, seen_sitemaps: Set[str]) -> List[str]:
         if url in seen_sitemaps or len(seen_sitemaps) >= self._max_sitemaps:
